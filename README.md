@@ -3,15 +3,15 @@
 <img src="assets/logo.jpg" style="height:70px"></img>
 <h1 align="center"><strong>From Sparse to Dense: Camera Relocalization with Scene-Specific Detector from Feature Gaussian Splatting</strong></h1>
   <p align="center">
-    <a href='' target='_blank'>Zhiwei Huang<sup>1,2</sup><sup>*</sup></a>&emsp;
-    <a href='' target='_blank'>Hailin Yu<sup>2</sup><sup>*</sup><sup>&dagger;</sup></a>&emsp;
+    <a href='' target='_blank'>Zhiwei Huang<sup>1,2</sup></a>&emsp;
+    <a href='' target='_blank'>Hailin Yu<sup>2</sup><sup>&dagger;</sup></a>&emsp;
     <a href='' target='_blank'>Yichun Shentu<sup>2</sup></a>&emsp;
     <a href='' target='_blank'>Jin Yuan<sup>2</sup></a>&emsp;
     <a href='' target='_blank'>Guofeng Zhang<sup>1,2</sup><sup>&dagger;</sup></a>&emsp;
     <br>
     <sup>1</sup>State Key Lab of CAD&CG, Zhejiang University&emsp;<sup>2</sup>SenseTime Research
     <br>
-    <sup>*</sup> Equal Contribution
+    <!-- <sup>*</sup> Equal Contribution -->
     <sup>&dagger;</sup> Corresponding Authors
     <br>
     <strong style="font-size: 20px; color:rgb(219, 39, 119);"> CVPR2025 </strong>
@@ -82,9 +82,8 @@ conda create -n stdloc python=3.8 -y
 pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124 
 pip install -r requirements.txt
 # install gsplat
-cd submodules/gsplat
-pip install -e .
-cd ../..
+pip install submodules/simple-knn
+pip install submodules/gsplat
 ```
 
 ### Data Preparation
@@ -130,6 +129,11 @@ wget https://www.repository.cam.ac.uk/bitstream/handle/1810/${IDs[i]}/${scenes[i
 ```bash
 cd submodules/Mask2Former
 pip install -r requirements.txt
+python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
+cd mask2former/modeling/pixel_decoder/ops
+sh make.sh
+cd ../../../..
+# download model
 wget https://dl.fbaipublicfiles.com/maskformer/mask2former/coco/panoptic/maskformer2_swin_large_IN21k_384_bs16_100ep/model_final_f07440.pkl
 cd ../..
 ```

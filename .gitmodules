@@ -4,3 +4,4 @@
 [submodule "submodules/gsplat"]
 	path = submodules/gsplat
 	url = https://github.com/nerfstudio-project/gsplat.git
+	branch = v1.4.0

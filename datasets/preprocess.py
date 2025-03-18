@@ -27,7 +27,7 @@ coco_metadata = MetadataCatalog.get("coco_2017_val_panoptic")
 
 # import project
 from mask2former import add_maskformer2_config
-from scene.colmap_loader import *
+from scene.colmap_loader import read_extrinsics_binary, read_extrinsics_text, read_intrinsics_binary, read_intrinsics_text
 from utils.image_utils import get_resolution_from_longest_edge
 
 
