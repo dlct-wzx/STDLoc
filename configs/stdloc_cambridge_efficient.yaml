@@ -5,23 +5,23 @@ sparse:
   dual_softmax: False
   dual_softmax_temp: 0.1
   topk: 1
-  threshold: 0
+  threshold: 0.5
   solver: poselib
   confidence: 0.99999
   reprojection_error: 12.0
-  max_iterations: 100000
-  min_iterations: 1000
+  max_iterations: 1000
+  min_iterations: 100
   detector_path: detector/30000_detector.pth
   landmark_path: detector/sampled_idx.pkl
 
 dense:
-  iters: 4
+  iters: 1
   coarse_dual_softmax_temp: 0.1
   fine_dual_softmax_temp: 0.1
   coarse_threshold: 0
   fine_threshold: 0
   solver: poselib
   confidence: 0.99999
-  reprojection_error: 8.0
-  max_iterations: 1000
-  min_iterations: 100
+  reprojection_error: 12.0
+  max_iterations: 100
+  min_iterations: 10
