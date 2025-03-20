@@ -1,24 +1,34 @@
 import numpy as np
 import torch
 import cv2
-import pycolmap
 import poselib
 import math
 
-def solve_pose(p2d, p3d, K, solver="poselib", reprojection_error=8.0, confidence=0.9999, max_iterations=100000, min_iterations=1000):
+def solve_pose(
+    p2d,
+    p3d,
+    K,
+    solver="poselib",
+    reprojection_error=8.0,
+    confidence=0.9999,
+    max_iterations=100000,
+    min_iterations=1000,
+):
     match_num = p2d.shape[0]
     if match_num < 4:
         print("[SKIP] No enough matches")
         return np.eye(4, dtype=np.float32), np.array([])
-    
 
     if solver == "opencv":
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(p3d, 
-                                                          p2d, 
-                                                          K, 
-                                                          distCoeffs=np.zeros((4,1)), 
-                                                          reprojectionError=reprojection_error, 
-                                                          confidence=confidence)
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            p3d,
+            p2d,
+            K,
+            distCoeffs=np.zeros((4, 1)),
+            reprojectionError=reprojection_error,
+            confidence=confidence,
+            iterationsCount=max_iterations
+        )
         if success:
             w2c = np.eye(4)
             cv2.Rodrigues(rvec, w2c[:3, :3])
@@ -26,53 +36,45 @@ def solve_pose(p2d, p3d, K, solver="poselib", reprojection_error=8.0, confidence
             w2c = w2c.astype(np.float32)
             inliers = np.array(inliers.flatten())
             return w2c, inliers
-            
-    elif solver == "colmap":
-        camera = pycolmap.Camera(
-            model="PINHOLE",
-            width=int(K[0, 2] * 2),
-            height=int(K[1, 2] * 2),
-            params=[K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
-        )
-        estimation_ops = pycolmap.AbsolutePoseEstimationOptions()
-        estimation_ops.ransac.max_error = reprojection_error
-        estimation_ops.ransac.confidence = confidence
-        refine_ops = pycolmap.AbsolutePoseRefinementOptions()
 
-        res = pycolmap.absolute_pose_estimation(p2d, p3d, camera, estimation_ops, refine_ops)
-
-        if res is not None:
-            w2c = res['cam_from_world'].matrix()
-            w2c = np.array(w2c).contiguous()
-            w2c = np.concatenate([w2c, np.array([[0, 0, 0, 1]])], axis=0).astype(np.float32)
-            inliers = res["inliers"]
-            indices = np.where(inliers)[0]
-            inliers = indices.reshape(-1, 1).astype(np.int32)
-            return w2c, np.array(inliers.flatten())
-        
     elif solver == "poselib":
-        camera = {'model': 'PINHOLE', 'width': int(K[0, 2] * 2), 'height': int(K[1, 2] * 2), 
-                  'params': [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]}
-        
+        camera = {
+            "model": "PINHOLE",
+            "width": int(K[0, 2] * 2),
+            "height": int(K[1, 2] * 2),
+            "params": [K[0, 0], K[1, 1], K[0, 2], K[1, 2]],
+        }
+
         max_reproj_error = reprojection_error
         confidence = confidence
-        
-        pose, info = poselib.estimate_absolute_pose(p2d, p3d, camera, 
-                                                {   'max_iterations': max_iterations,
-                                                    'min_iterations': min_iterations,
-                                                    'max_reproj_error': max_reproj_error,
-                                                    'success_prob': confidence}, 
-                                                {'verbose': False})
 
-        if info['num_inliers'] > 0:
+        pose, info = poselib.estimate_absolute_pose(
+            p2d,
+            p3d,
+            camera,
+            {
+                "max_iterations": max_iterations,
+                "min_iterations": min_iterations,
+                "max_reproj_error": max_reproj_error,
+                "success_prob": confidence,
+            },
+            {
+                "verbose": False,
+            },
+        )
+
+        if info["num_inliers"] > 0:
             w2c = pose.Rt
-            w2c = np.concatenate([w2c, np.array([[0, 0, 0, 1]])], axis=0).astype(np.float32)
+            w2c = np.concatenate([w2c, np.array([[0, 0, 0, 1]])], axis=0).astype(
+                np.float32
+            )
             inliers = info["inliers"]
             indices = np.where(inliers)[0]
             inliers = indices.reshape(-1, 1).astype(np.int32)
             return w2c, inliers.flatten()
 
     return np.eye(4, dtype=np.float32), np.array([])
+
 
 def cal_pose_error(pred_w2c, gt_w2c):
     """
@@ -100,7 +102,13 @@ def compute_reprojection_error(points_3D, points_2D, camera_matrix, w2c):
     Compute the reprojection error between the 3D points and the 2D points.
     """
     projection_matrix = camera_matrix @ w2c[:3, :]
-    projected_points = projection_matrix @ torch.cat([points_3D, torch.ones((points_3D.shape[0], 1), device=points_3D.device)], dim=1).t()
+    projected_points = (
+        projection_matrix
+        @ torch.cat(
+            [points_3D, torch.ones((points_3D.shape[0], 1), device=points_3D.device)],
+            dim=1,
+        ).t()
+    )
     projected_points = projected_points[:2, :] / projected_points[2, :]
     projected_points = projected_points.t()
     reprojection_error = torch.linalg.norm(points_2D - projected_points, dim=1)
@@ -110,6 +118,7 @@ def compute_reprojection_error(points_3D, points_2D, camera_matrix, w2c):
 def normalize(x):
     return x / np.linalg.norm(x)
 
+
 def viewmatrix(z, up, pos):
     vec2 = normalize(z)
     vec1_avg = up
@@ -117,6 +126,7 @@ def viewmatrix(z, up, pos):
     vec1 = normalize(np.cross(vec2, vec0))
     m = np.stack([vec0, vec1, vec2, pos], 1)
     return m
+
 
 def poses_avg(poses):
     hwf = poses[0, :3, -1:]
@@ -127,6 +137,7 @@ def poses_avg(poses):
     c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
 
     return c2w
+
 
 def render_path_spiral(views, focal=30, zrate=0.5, rots=2, N=120):
     poses = []
@@ -149,14 +160,12 @@ def render_path_spiral(views, focal=30, zrate=0.5, rots=2, N=120):
     for theta in np.linspace(0.0, 2.0 * np.pi * rots, N + 1)[:-1]:
         c = np.dot(
             c2w[:3, :4],
-            np.array([np.cos(theta), -np.sin(theta), -np.sin(theta * zrate), 1.0]) * rads,
+            np.array([np.cos(theta), -np.sin(theta), -np.sin(theta * zrate), 1.0])
+            * rads,
         )
         z = normalize(c - np.dot(c2w[:3, :4], np.array([0, 0, -focal, 1.0])))
         render_pose = np.eye(4)
         render_pose[:3] = viewmatrix(z, up, c)
-        # render_pose[:3] =  np.array([[ 9.9996626e-01, -7.5253481e-03, -3.2866236e-03, -5.6992844e-02],
-        #             [-7.7875191e-03, -9.9601853e-01, -8.8805482e-02, -2.9015102e+00],
-        #             [-2.6052459e-03,  8.8828087e-02, -9.9604356e-01, -2.3510060e+00]])
         render_pose[:3, 1:3] *= -1
         render_poses.append(np.linalg.inv(render_pose))
     return render_poses
@@ -223,7 +232,7 @@ def spherify_poses(views):
 
         render_pose = np.eye(4)
         render_pose[:3] = p
-        #render_pose[:3, 1:3] *= -1
+        # render_pose[:3, 1:3] *= -1
         new_poses.append(render_pose)
 
     new_poses = np.stack(new_poses, 0)
