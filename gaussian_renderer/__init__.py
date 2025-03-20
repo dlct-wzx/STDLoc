@@ -368,7 +368,7 @@ def render_gsplat_2dgs(
         "surf_depth": depth,
     }
 
-# TODO 传入K代替fovx, fovy
+
 def render_from_pose_gsplat(
     pc: GaussianModel,
     pose,
