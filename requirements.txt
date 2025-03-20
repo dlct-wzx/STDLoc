@@ -5,7 +5,6 @@ opencv_python
 Pillow
 plyfile
 poselib
-pycolmap
 PyYAML
 scikit_learn
 scipy
