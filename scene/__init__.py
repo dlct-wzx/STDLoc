@@ -17,14 +17,14 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-# from utils.masker import stuff_masker
+from torch.utils.data import Dataset, DataLoader
+from utils.camera_utils import loadCam
+
 
 class Scene:
     gaussians : GaussianModel
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], num=-1, read_image_list=None): 
-        """b
-        :param path: Path to colmap scene main folder.
-        """
+
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], num=-1, images_to_read=None, preload_cameras=True): 
         self.args = args
         self.model_path = args.model_path
         self.source_path = args.source_path
@@ -32,6 +32,9 @@ class Scene:
         self.gaussians = gaussians
         self.feature_type = args.feature_type
         self.longest_edge = args.longest_edge
+        self.resolution_scales = resolution_scales
+        self.preload_cameras = preload_cameras
+        self.shuffle = shuffle
 
         if load_iteration:
             if load_iteration == -1:
@@ -44,10 +47,7 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.feature_type, args.images, args.eval, images_to_read = read_image_list)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
-            print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path,  args.feature_type, args.white_background, args.eval) 
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.feature_type, args.images, args.eval, images_to_read = images_to_read)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -71,18 +71,20 @@ class Scene:
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
-        for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")
-            if num != -1:
-                step_train = len(scene_info.train_cameras) // num
-                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras[::step_train], resolution_scale, args) if not args.eval else []
-                print("Loading Test Cameras")
-                step_test = len(scene_info.test_cameras) // num
-                self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras[::step_test], resolution_scale, args, )
-            else:
-                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args) if not args.eval else []
-                print("Loading Test Cameras")
-                self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+        if preload_cameras:
+            for resolution_scale in resolution_scales:
+                if num != -1:
+                    print("Loading Train Cameras")
+                    step_train = len(scene_info.train_cameras) // num
+                    self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras[::step_train], resolution_scale, args) if not args.eval else []
+                    print("Loading Test Cameras")
+                    step_test = len(scene_info.test_cameras) // num
+                    self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras[::step_test], resolution_scale, args)
+                else:
+                    print("Loading Train Cameras")
+                    self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args) if not args.eval else []
+                    print("Loading Test Cameras")
+                    self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -93,14 +95,36 @@ class Scene:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, scene_info.loc_feature_dim, args.speedup) 
         
         self.scene_info = scene_info
-        self.white_background = args.white_background
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
     def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
+        if self.preload_cameras:
+            return self.train_cameras[scale]
+        else:
+            return DataLoader(SceneDataset(self, split='train'), batch_size=None, shuffle=self.shuffle, pin_memory=True, num_workers=4)
 
     def getTestCameras(self, scale=1.0):
-        return self.test_cameras[scale]
+        if self.preload_cameras:
+            return self.test_cameras[scale]
+        else:
+            return DataLoader(SceneDataset(self, split='test'), batch_size=None, shuffle=self.shuffle, pin_memory=True, num_workers=4)
+    
+
+class SceneDataset(Dataset):
+
+    def __init__(self, scene: Scene, split='train'):
+        self.scene = scene
+        self.split = split
+
+    def __getitem__(self, index):
+        if self.split == 'train':
+            camera = loadCam(self.scene.args, index, self.scene.scene_info.train_cameras[index], self.scene.resolution_scales[0])
+        else:
+            camera = loadCam(self.scene.args, index, self.scene.scene_info.test_cameras[index], self.scene.resolution_scales[0])
+        return camera
+
+    def __len__(self):
+        return len(self.scene.scene_info.train_cameras) if self.split == 'train' else len(self.scene.scene_info.test_cameras)

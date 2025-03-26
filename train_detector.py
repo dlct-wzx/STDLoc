@@ -81,7 +81,6 @@ def calculate_match_score(
         & (xy[1] < gt_feature_map.shape[1])
     )
 
-    # print("in_mask:", in_mask.sum())
     if render_visible_mask is not None:
         visible_mask = in_mask & render_visible_mask
     else:
@@ -92,7 +91,6 @@ def calculate_match_score(
         img_mask_expand = torch.zeros_like(visible_mask, dtype=torch.bool)
         img_mask_expand[in_mask] = img_mask[0, visible_xy[1], visible_xy[0]]
         visible_mask = visible_mask & img_mask_expand
-    # print("visile_mask:", visile_mask.sum())
 
     xy = xy[:, visible_mask]
     depths = depths[visible_mask]
@@ -117,13 +115,11 @@ def generate_gt_map(
         idx_sampled = idx_sampled[render_visible_mask]
     sampled_xyz = gaussians.get_xyz[idx_sampled]
 
-    # sampled_feat = gaussians.get_loc_feature.squeeze()[idx_sampled]
-
     gt_map = torch.zeros(
         (1, gt_feature_map.shape[1], gt_feature_map.shape[2]),
         device=gt_feature_map.device,
     )
-    # 
+    
     xyz_homo = torch.cat(
         [sampled_xyz, torch.ones(sampled_xyz.shape[0], 1, device=sampled_xyz.device)],
         dim=-1,
@@ -205,7 +201,7 @@ def matching_oriented_sample(
         ).squeeze(0)
         gt_feature_map = F.normalize(gt_feature_map, p=2, dim=0)
 
-        viewmat = viewpoint_cam.world_view_transform.transpose(0, 1)  # [4, 4]
+        viewmat = viewpoint_cam.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
         focalX = fov2focal(viewpoint_cam.FoVx, gt_feature_map.shape[2])
         focalY = fov2focal(viewpoint_cam.FoVy, gt_feature_map.shape[1])
         # print("focal:", focalX, focalY)
@@ -221,9 +217,7 @@ def matching_oriented_sample(
         if render_visible_masks.get(viewpoint_cam.image_name, None) is None:
             render_visible_mask = get_render_visible_mask(
                 gaussians,
-                viewmat,
-                viewpoint_cam.FoVx,
-                viewpoint_cam.FoVy,
+                viewpoint_cam,
                 gt_feature_map.shape[2],
                 gt_feature_map.shape[1],
             )
@@ -311,7 +305,7 @@ def evaluate_detector(
                 ).squeeze(0)
                 gt_feature_map = F.normalize(gt_feature_map, p=2, dim=0)
 
-                viewmat = viewpoint_cam.world_view_transform.transpose(0, 1)  # [4, 4]
+                viewmat = viewpoint_cam.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
                 focalX = fov2focal(viewpoint_cam.FoVx, gt_feature_map.shape[2])
                 focalY = fov2focal(viewpoint_cam.FoVy, gt_feature_map.shape[1])
                 # print("focal:", focalX, focalY)
@@ -330,9 +324,7 @@ def evaluate_detector(
                 if visible_mask is None:
                     visible_mask = get_render_visible_mask(
                         gaussians,
-                        viewmat,
-                        viewpoint_cam.FoVx,
-                        viewpoint_cam.FoVy,
+                        viewpoint_cam,
                         gt_feature_map.shape[2],
                         gt_feature_map.shape[1],
                     )
@@ -340,7 +332,6 @@ def evaluate_detector(
                 else:
                     visible_mask = render_visible_masks[viewpoint_cam.image_name]
 
-                # gt_map = generate_gt_map(gaussians, gt_feature_map, sampled_idx, viewmat, K, None)
                 gt_map = generate_gt_map(
                     gaussians,
                     gt_feature_map,
@@ -447,8 +438,6 @@ def training_detector(
     save_path = os.path.join(scene.model_path, detector_folder)
     os.makedirs(save_path, exist_ok=True)
     pickle.dump(sampled_idx, open(os.path.join(save_path, "sampled_idx.pkl"), "wb"))
-    pickle.dump(score_avg, open(os.path.join(save_path, "scores.pkl"), "wb"))
-    pickle.dump(score_num, open(os.path.join(save_path, "score_num.pkl"), "wb"))
 
     # training scene-specific detector
     print("Training detector...")
@@ -456,7 +445,6 @@ def training_detector(
     iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
-    ema_loss_for_log = 0.0
     progress_bar = tqdm(range(0, train_iteration), desc="Scene-Specific Detector")
     first_iter = 1
 
@@ -490,7 +478,7 @@ def training_detector(
         gt_feature_map = F.normalize(gt_feature_map, p=2, dim=0)
 
         # get viewmat and K
-        viewmat = viewpoint_cam.world_view_transform.transpose(0, 1)  # [4, 4]
+        viewmat = viewpoint_cam.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
         focalX = fov2focal(viewpoint_cam.FoVx, gt_feature_map.shape[2])
         focalY = fov2focal(viewpoint_cam.FoVy, gt_feature_map.shape[1])
         K = torch.tensor(
@@ -508,9 +496,7 @@ def training_detector(
         if render_visible_mask is None:
             render_visible_mask = get_render_visible_mask(
                 gaussians,
-                viewmat,
-                viewpoint_cam.FoVx,
-                viewpoint_cam.FoVy,
+                viewpoint_cam,
                 gt_feature_map.shape[2],
                 gt_feature_map.shape[1],
             )
@@ -553,12 +539,11 @@ def training_detector(
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = loss.item()
+            loss_val = loss.item()
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
                     {
-                        "Loss": f"{ema_loss_for_log:.{7}f}",
-                        "LR": f"{optimizer.param_groups[0]['lr']:.{7}f}",
+                        "Loss": f"{loss_val:.{7}f}",
                     }
                 )
                 progress_bar.update(10)
@@ -566,7 +551,7 @@ def training_detector(
                 progress_bar.close()
             if tb_writer:
                 tb_writer.add_scalar(
-                    "detector_loss_patches/training_loss", ema_loss_for_log, iteration
+                    "detector_loss_patches/training_loss", loss_val, iteration
                 )
                 tb_writer.add_scalar(
                     "detector_loss_patches/lr",

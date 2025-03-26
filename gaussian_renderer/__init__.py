@@ -16,17 +16,25 @@ import torch.nn.functional as F
 from gsplat import rasterization, rasterization_2dgs
 
 from scene.gaussian_model import GaussianModel
-
-
-def fov2focal(fov, pixels):
-    return pixels / (2 * math.tan(fov / 2))
+from utils.graphics_utils import fov2focal
 
 
 def get_render_visible_mask(
-    pc: GaussianModel, pose, fovx, fovy, width, height, **rasterize_args
+    pc: GaussianModel, viewpoint_camera, width, height, **rasterize_args
 ):
-    tanfovx = math.tan(fovx * 0.5)
-    tanfovy = math.tan(fovy * 0.5)
+    scales = pc.get_scaling
+    if scales.shape[1] == 2:
+        return get_render_visible_mask_2dgs(pc, viewpoint_camera, width, height, **rasterize_args)
+
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity
+    rotations = pc.get_rotation
+    colors = pc.get_features  # [N, K, 3]
+    sh_degree = pc.active_sh_degree
+    
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     focal_length_x = width / (2 * tanfovx)
     focal_length_y = height / (2 * tanfovy)
     K = torch.tensor(
@@ -37,50 +45,64 @@ def get_render_visible_mask(
         ],
         device="cuda",
     )
+
+    colors, render_alphas, info = rasterization(
+        means=means3D,  # [N, 3]
+        quats=rotations,  # [N, 4]
+        scales=scales,  # [N, 3]
+        opacities=opacity.squeeze(-1),  # [N,]
+        colors=colors,
+        viewmats=viewmat[None],  # [1, 4, 4]
+        Ks=K[None],  # [1, 3, 3]
+        width=width,
+        height=height,
+        packed=False,
+        sh_degree=sh_degree,
+        **rasterize_args
+    )
+
+    colors.sum().backward()
+    render_visible_mask = means3D.grad.norm(dim=-1) > 0
+    means3D.grad.zero_()
+
+    return render_visible_mask
+
+
+def get_render_visible_mask_2dgs(
+    pc: GaussianModel, viewpoint_camera, width, height, **rasterize_args
+):
+    scales = pc.get_scaling
     means3D = pc.get_xyz
     opacity = pc.get_opacity
     rotations = pc.get_rotation
-
     colors = pc.get_features  # [N, K, 3]
     sh_degree = pc.active_sh_degree
-    viewmat = pose  # [4, 4]
 
-    scales = pc.get_scaling
-    if scales.shape[-1] == 2:
-        scales = torch.cat(
-            [
-                scales,
-                torch.ones(
-                    scales.shape[0], 1, device=scales.device, dtype=scales.dtype
-                ),
-            ],
-            dim=-1,
-        )  # (n, 2) -> (n, 3)
-        # print(colors.shape)
-        colors, alphas, normals, surf_normals, distort, median_depth, info = (
-            rasterization_2dgs(
-                means=means3D,  # [N, 3]
-                quats=rotations,  # [N, 4]
-                scales=scales,  # [N, 3]
-                opacities=opacity.squeeze(-1),  # [N,]
-                colors=colors,
-                viewmats=viewmat[None],  # [1, 4, 4]
-                Ks=K[None],  # [1, 3, 3]
-                width=width,
-                height=height,
-                packed=False,
-                sh_degree=sh_degree,
-                render_mode="RGB",
-                **rasterize_args
-            )
-        )
-        # [1, H, W, 3] -> [3, H, W]
-        colors.sum().backward()
-        render_visible_mask = means3D.grad.norm(dim=-1) > 0
-        means3D.grad.zero_()
-        # print("visible_filter_num:", (info['radii'] > 0).sum())
-    else:
-        colors, render_alphas, info = rasterization(
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    focal_length_x = width / (2 * tanfovx)
+    focal_length_y = height / (2 * tanfovy)
+    K = torch.tensor(
+        [
+            [focal_length_x, 0, width / 2.0],
+            [0, focal_length_y, height / 2.0],
+            [0, 0, 1],
+        ],
+        device="cuda",
+    )
+    
+    scales = torch.cat(
+        [
+            scales,
+            torch.ones(
+                scales.shape[0], 1, device=scales.device, dtype=scales.dtype
+            ),
+        ],
+        dim=-1,
+    )  
+    colors, alphas, normals, surf_normals, distort, median_depth, info = (
+        rasterization_2dgs(
             means=means3D,  # [N, 3]
             quats=rotations,  # [N, 4]
             scales=scales,  # [N, 3]
@@ -92,14 +114,14 @@ def get_render_visible_mask(
             height=height,
             packed=False,
             sh_degree=sh_degree,
+            render_mode="RGB",
             **rasterize_args
         )
+    )
+    colors.sum().backward()
+    render_visible_mask = means3D.grad.norm(dim=-1) > 0
+    means3D.grad.zero_()
 
-        colors.sum().backward()
-        render_visible_mask = means3D.grad.norm(dim=-1) > 0
-        means3D.grad.zero_()
-
-    # print("render visible:", render_visible_mask.sum())
     return render_visible_mask
 
 
@@ -140,7 +162,7 @@ def render_gsplat(
         )
 
     rotations = pc.get_rotation
-    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1)  # [4, 4]
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
     if override_color is not None:
         colors = override_color  # [N, 3]
         sh_degree = None
@@ -250,6 +272,8 @@ def render_gsplat_2dgs(
     """
     Render the scene.
     """
+    if 'rasterize_mode' in rasterize_args:
+        del rasterize_args['rasterize_mode']
     width, height = viewpoint_camera.image_width, viewpoint_camera.image_height
     max_edge = max(width, height)
     if max_edge > longest_edge:
@@ -278,9 +302,9 @@ def render_gsplat_2dgs(
             torch.ones(scales.shape[0], 1, device=scales.device, dtype=scales.dtype),
         ],
         dim=-1,
-    )  # (n, 2) -> (n, 3)
+    )
     rotations = pc.get_rotation
-    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1)  # [4, 4]
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
     if override_color is not None:
         colors = override_color  # [N, 3]
         sh_degree = None
@@ -518,6 +542,8 @@ def render_from_pose_gsplat_2dgs(
     """
     Render the scene.
     """
+    if 'rasterize_mode' in rasterize_args:
+        del rasterize_args['rasterize_mode']
     means3D = pc.get_xyz
     opacity = pc.get_opacity.squeeze()
     scales = pc.get_scaling
@@ -527,7 +553,7 @@ def render_from_pose_gsplat_2dgs(
             torch.ones(scales.shape[0], 1, device=scales.device, dtype=scales.dtype),
         ],
         dim=-1,
-    )  # (n, 2) -> (n, 3)
+    ) 
     rotations = pc.get_rotation
 
     focalx = fov2focal(fovx, width)

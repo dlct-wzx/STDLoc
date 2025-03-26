@@ -407,9 +407,7 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--cfg", default=None, type=str)
-    parser.add_argument("--test_num", default=-1, type=int)
     parser.add_argument("--prefix", default=None, type=str)
-    # parser.add_argument("--vis", action="store_true")
     args = get_combined_args(parser)
     args.eval = True
 
@@ -434,15 +432,11 @@ if __name__ == "__main__":
         gaussians,
         load_iteration=args.iteration,
         shuffle=False,
-        num=args.test_num,
+        preload_cameras=False,
     )
-    
 
     # Set up config
     config = yaml.load(open(args.cfg), Loader=yaml.FullLoader)
-
-    # if args.vis:
-    #     config["vis_path"] = output_path + "/vis"
         
     config["dense"]["norm_before_render"] = dataset.norm_before_render
     config["feature_type"] = dataset.feature_type
