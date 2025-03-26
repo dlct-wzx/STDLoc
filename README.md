@@ -49,14 +49,14 @@ The code in this repository has a better performance than our paper, through som
 
 ### 7-Scenes
 
-| Method         | Chess     | Fire      | Heads     | Office    | Pumpkin   | Redkitchen | Stairs    | Avg.↓[cm/◦] |
+| Method         | Chess     | Fire      | Heads     | Office    | Pumpkin   | RedKitchen | Stairs    | Avg.↓[cm/◦] |
 | -------------- | --------- | --------- | --------- | --------- | --------- | ---------- | --------- | ----------- |
 | STDLoc (paper) | 0.46/0.15 | 0.57/0.24 | 0.45/0.26 | 0.86/0.24 | 0.93/0.21 | 0.63/0.19  | 1.42/0.41 | 0.76/0.24   |
 | STDLoc (repo)  | 0.43/0.13 | 0.49/0.20 | 0.41/0.24 | 0.72/0.21 | 0.91/0.23 | 0.59/0.14  | 1.19/0.36 | 0.67/0.22   |
 
 ### Cambridge Landmarks
 
-| Methods        | Court     | King’s    | Hospital  | Shop     | St. Mary’s | Avg.↓[cm/◦] |
+| Method        | Court     | King’s    | Hospital  | Shop     | St. Mary’s | Avg.↓[cm/◦] |
 | -------------- | --------- | --------- | --------- | -------- | ---------- | ----------- |
 | STDLoc (paper) | 15.7/0.06 | 15.0/0.17 | 11.9/0.21 | 3.0/0.13 | 4.7/0.14   | 10.1/0.14   |
 | STDLoc (repo)  | 11.5/0.06 | 14.7/0.15 | 11.3/0.21 | 2.5/0.12 | 3.5/0.12   | 8.7/0.13    |
