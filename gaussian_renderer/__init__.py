@@ -361,7 +361,7 @@ def render_gsplat_2dgs(
             quats=rotations[visible_mask],  # [N, 4]
             scales=scales[visible_mask],  # [N, 3]
             opacities=opacity.squeeze(-1)[visible_mask],  # [N,]
-            colors=loc_feature.squeeze(),
+            colors=loc_feature,
             viewmats=viewmat[None],  # [1, 4, 4]
             Ks=K[None],  # [1, 3, 3]
             width=width,
@@ -601,7 +601,7 @@ def render_from_pose_gsplat_2dgs(
         pass
 
     if rgb_only is False:
-        loc_feature = pc.get_loc_feature.squeeze()
+        loc_feature = pc.get_loc_feature[visible_mask].squeeze()
         if norm_feat_bf_render:
             loc_feature = F.normalize(loc_feature, p=2, dim=-1)
 
@@ -610,7 +610,7 @@ def render_from_pose_gsplat_2dgs(
             quats=rotations[visible_mask],  # [N, 4]
             scales=scales[visible_mask],  # [N, 3]
             opacities=opacity.squeeze(-1)[visible_mask],  # [N,]
-            colors=loc_feature.squeeze(),
+            colors=loc_feature,
             viewmats=pose[None],  # [1, 4, 4]
             Ks=K[None],  # [1, 3, 3]
             width=int(width),
