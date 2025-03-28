@@ -505,12 +505,11 @@ def training_detector(
             render_visible_mask = render_visible_masks[viewpoint_cam.image_name]
 
         # generate gt_map
-        # gt_map = generate_gt_map(gaussians, gt_feature_map, sampled_idx, viewmat, K, None)
         gt_map = generate_gt_map(
             gaussians, gt_feature_map, sampled_idx, viewmat, K, render_visible_mask
         )
 
-        # use mask to filter out border and object
+        # use mask to filter out object
         if masks is not None:
             object_mask = masks[viewpoint_cam.image_name][0].cuda()[None]
             distort_mask = masks[viewpoint_cam.image_name][2].cuda()[None]
@@ -615,10 +614,10 @@ if __name__ == "__main__":
     op = OptimizationParams(parser)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
     parser.add_argument(
-        "--test_iterations", nargs="+", type=int, default=[2000, 10000, 20000, 30000]
+        "--test_iterations", nargs="+", type=int, default=[10000, 20000, 30000]
     )
     parser.add_argument(
-        "--save_iterations", nargs="+", type=int, default=[2000, 10000, 20000, 30000]
+        "--save_iterations", nargs="+", type=int, default=[10000, 20000, 30000]
     )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--iteration", type=int, default=30000)
@@ -627,10 +626,7 @@ if __name__ == "__main__":
     parser.add_argument("--landmark_k", type=int, default=32)
 
     args = get_combined_args(parser)
-    print(args)
     args.save_iterations.append(args.iterations)
-
-    print("Training detector " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
@@ -639,21 +635,17 @@ if __name__ == "__main__":
     dataset = lp.extract(args)
     if dataset.gaussian_type == "3dgs":
         from scene.gaussian_model import GaussianModel
-
         gaussians = GaussianModel(dataset.sh_degree)
     elif dataset.gaussian_type == "2dgs":
         from scene.gaussian_model import GaussianModel_2dgs
-
         gaussians = GaussianModel_2dgs(dataset.sh_degree)
 
     masks = None
     if os.path.exists(os.path.join(dataset.source_path, "masks.pkl")):
         import pickle
-
         masks = pickle.load(open(os.path.join(dataset.source_path, "masks.pkl"), "rb"))
 
     scene = Scene(dataset, gaussians, load_iteration=args.iteration)
-    # scene = Scene(dataset, gaussians, load_iteration=args.iteration, num=3)
 
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(

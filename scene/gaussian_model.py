@@ -613,7 +613,6 @@ class GaussianModel(nn.Module):
             l.append('f_dc_{}'.format(i))
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
-
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -638,9 +637,9 @@ class GaussianModel(nn.Module):
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, loc_feature), axis=1)
             
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)

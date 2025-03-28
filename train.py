@@ -49,6 +49,8 @@ def training(
     test_detector_iterations=[10_000, 20_000, 30_000],
     save_detector_iterations=[10_000, 20_000, 30_000],
     detector_folder="detector",
+    landmark_num=16384,
+    landmark_k=32,
 ):
     print(opt)
     first_iter = 0
@@ -198,6 +200,31 @@ def training(
             + 1.0 * Ll1_feature
         )
 
+        # regularization for 2DGS
+        if dataset.gaussian_type == "2dgs":
+            lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+            lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+            rend_dist = render_pkg["rend_dist"]
+            rend_normal  = render_pkg['rend_normal']
+            surf_normal = render_pkg['surf_normal']
+            rend_alpha = render_pkg['rend_alpha']
+            # ------------------------------
+            surf_normal *= rend_alpha.squeeze(0).detach()
+            rend_normal = rend_normal.squeeze(0).permute(2, 0, 1)
+            if len(surf_normal.shape) == 4:
+                surf_normal = surf_normal.squeeze(0)
+            surf_normal = surf_normal.permute(2, 0, 1)
+            # ------------------------------
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            if masks is not None:
+                normal_error *= mask
+                rend_dist = rend_dist.squeeze(-1)
+                rend_dist *= mask
+            normal_loss = lambda_normal * (normal_error).mean()
+            dist_loss = lambda_dist * (rend_dist).mean()
+
+            loss = loss + dist_loss + normal_loss
+
         loss.backward()
         iter_end.record()
 
@@ -281,6 +308,8 @@ def training(
             tb_writer=tb_writer,
             train_iteration=30000,
             detector_folder=detector_folder,
+            landmark_num=landmark_num,
+            landmark_k=landmark_k,
         )
 
 
@@ -360,7 +389,6 @@ def training_report(
                         longest_edge=dataset.longest_edge,
                         rasterize_mode="antialiased",
                     )
-
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     feature_map = render_pkg["feature_map"]
@@ -498,6 +526,8 @@ if __name__ == "__main__":
         "--save_detector_iterations", nargs="+", type=int, default=[7000, 30000]
     )
     parser.add_argument("--detector_folder", type=str, default="detector")
+    parser.add_argument("--landmark_num", type=int, default=16384)
+    parser.add_argument("--landmark_k", type=int, default=32)
 
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 30000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 30000])
@@ -525,6 +555,8 @@ if __name__ == "__main__":
         args.test_detector_iterations,
         args.save_detector_iterations,
         args.detector_folder,
+        args.landmark_num,
+        args.landmark_k,
     )
 
     # All done

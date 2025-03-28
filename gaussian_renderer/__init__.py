@@ -129,7 +129,6 @@ def render_gsplat(
     viewpoint_camera,
     pc: GaussianModel,
     bg_color: torch.Tensor,
-    scaling_modifier=1.0,
     override_color=None,
     rgb_only=False,
     norm_feat_bf_render=True,
@@ -139,19 +138,19 @@ def render_gsplat(
     **rasterize_args
 ):
     """
-    Render the scene.
+    Render the 3DGS scene.
     Background tensor (bg_color) must be on GPU!
     """
-
     means3D = pc.get_xyz
     opacity = pc.get_opacity
-    scales = pc.get_scaling * scaling_modifier
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda() # [4, 4]
     if scales.shape[1] == 2:
         return render_gsplat_2dgs(
             viewpoint_camera,
             pc,
             bg_color,
-            scaling_modifier,
             override_color,
             rgb_only,
             norm_feat_bf_render,
@@ -160,9 +159,7 @@ def render_gsplat(
             longest_edge,
             **rasterize_args
         )
-
-    rotations = pc.get_rotation
-    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
+    
     if override_color is not None:
         colors = override_color  # [N, 3]
         sh_degree = None
@@ -173,12 +170,12 @@ def render_gsplat(
     if bg_color is None:
         bg_color = torch.zeros(3, device="cuda")
 
+    # calculate intrinsic matrix
     width, height = viewpoint_camera.image_width, viewpoint_camera.image_height
     max_edge = max(width, height)
     if max_edge > longest_edge:
-        scaling_modifier *= longest_edge / max_edge
-        width, height = int(width * scaling_modifier), int(height * scaling_modifier)
-
+        factor = longest_edge / max_edge
+        width, height = int(width * factor), int(height * factor)
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     focal_length_x = width / (2 * tanfovx)
@@ -260,7 +257,6 @@ def render_gsplat_2dgs(
     viewpoint_camera,
     pc: GaussianModel,
     bg_color=None,
-    scaling_modifier=1.0,
     override_color=None,
     rgb_only=False,
     norm_feat_bf_render=True,
@@ -270,16 +266,30 @@ def render_gsplat_2dgs(
     **rasterize_args
 ):
     """
-    Render the scene.
+    Render the 2DGS scene.
     """
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
+    scales = torch.cat(
+        [
+            scales,
+            torch.ones(scales.shape[0], 1, device=scales.device, dtype=scales.dtype),
+        ],
+        dim=-1,
+    )
+
     if 'rasterize_mode' in rasterize_args:
         del rasterize_args['rasterize_mode']
+
+    # calculate intrinsic matrix
     width, height = viewpoint_camera.image_width, viewpoint_camera.image_height
     max_edge = max(width, height)
     if max_edge > longest_edge:
-        scaling_modifier *= longest_edge / max_edge
-        width, height = int(width * scaling_modifier), int(height * scaling_modifier)
-
+        factor = longest_edge / max_edge
+        width, height = int(width * factor), int(height * factor)
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     focal_length_x = width / (2 * tanfovx)
@@ -293,18 +303,6 @@ def render_gsplat_2dgs(
         device="cuda",
     )
 
-    means3D = pc.get_xyz
-    opacity = pc.get_opacity
-    scales = pc.get_scaling * scaling_modifier
-    scales = torch.cat(
-        [
-            scales,
-            torch.ones(scales.shape[0], 1, device=scales.device, dtype=scales.dtype),
-        ],
-        dim=-1,
-    )
-    rotations = pc.get_rotation
-    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).cuda()  # [4, 4]
     if override_color is not None:
         colors = override_color  # [N, 3]
         sh_degree = None
@@ -409,9 +407,7 @@ def render_from_pose_gsplat(
     **rasterize_args
 ):
     """
-    Render the scene.
-
-    Background tensor (bg_color) must be on GPU!
+    Render the 3DGS scene from pose.
     """
     means3D = pc.get_xyz
     opacity = pc.get_opacity
@@ -419,7 +415,6 @@ def render_from_pose_gsplat(
     rotations = pc.get_rotation
     colors = pc.get_features  # [N, K, 3]
     sh_degree = pc.active_sh_degree
-
     if scales.shape[1] == 2:
         return render_from_pose_gsplat_2dgs(
             pc,
@@ -545,8 +540,11 @@ def render_from_pose_gsplat_2dgs(
     if 'rasterize_mode' in rasterize_args:
         del rasterize_args['rasterize_mode']
     means3D = pc.get_xyz
-    opacity = pc.get_opacity.squeeze()
+    opacity = pc.get_opacity
     scales = pc.get_scaling
+    rotations = pc.get_rotation
+    colors = pc.get_features  # [N, K, 3]
+    sh_degree = pc.active_sh_degree
     scales = torch.cat(
         [
             scales,
@@ -554,16 +552,19 @@ def render_from_pose_gsplat_2dgs(
         ],
         dim=-1,
     ) 
-    rotations = pc.get_rotation
 
-    focalx = fov2focal(fovx, width)
-    focaly = fov2focal(fovy, height)
+    tanfovx = math.tan(fovx * 0.5)
+    tanfovy = math.tan(fovy * 0.5)
+    focal_length_x = width / (2 * tanfovx)
+    focal_length_y = height / (2 * tanfovy)
     K = torch.tensor(
-        [[focalx, 0, width / 2], [0, focaly, height / 2], [0, 0, 1]]
-    ).cuda()
-
-    colors = pc.get_features  # [N, K, 3]
-    sh_degree = pc.active_sh_degree
+        [
+            [focal_length_x, 0, width / 2.0],
+            [0, focal_length_y, height / 2.0],
+            [0, 0, 1],
+        ],
+        device="cuda",
+    )
 
     if bg_color is None:
         bg_color = torch.zeros(4, device="cuda")
