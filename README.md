@@ -95,9 +95,8 @@ We use two public datasets:
 
 ```bash
 export dataset=datasets/7scenes
-for scene in chess fire heads office pumpkin redkitchen stairs; \
-do wget http://download.microsoft.com/download/2/8/5/28564B23-0828-408F-8631-23B1EFF1DAC8/$scene.zip -P $dataset \
-&& unzip $dataset/$scene.zip -d $dataset && unzip $dataset/$scene/'*.zip' -d $dataset/$scene; done
+for scene in chess office pumpkin redkitchen stairs; \
+do unzip $dataset/$scene.zip -d $dataset && unzip $dataset/$scene/'*.zip' -d $dataset/$scene; done
 ```
 
 2. Download full reconstructions
@@ -119,10 +118,8 @@ do mkdir -p $dataset/$scene/sparse && cp -r $dataset/7scenes_reference_models/$s
 ```bash
 export dataset=datasets/cambridge
 export scenes=( "KingsCollege" "OldHospital" "StMarysChurch" "ShopFacade" "GreatCourt" )
-export IDs=( "251342" "251340" "251294" "251336" "251291" )
 for i in "${!scenes[@]}"; do
-wget https://www.repository.cam.ac.uk/bitstream/handle/1810/${IDs[i]}/${scenes[i]}.zip -P $dataset \
-&& unzip $dataset/${scenes[i]}.zip -d $dataset ; done
+unzip $dataset/${scenes[i]}.zip -d $dataset ; done
 ```
 
 2. Install Mask2Former:

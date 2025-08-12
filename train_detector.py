@@ -41,6 +41,12 @@ import torch.nn.functional as F
 from encoders.feature_extractor import FeatureExtractor
 from scene.kpdetector import KpDetector
 
+try:
+    from sklearn.neighbors import NearestNeighbors
+    SKLEARN_FOUND = True
+except ImportError:
+    SKLEARN_FOUND = False
+
 
 def get_sampled_gaussian(gaussians: GaussianModel, idx_sampled):
     sampled_gaussians = GaussianModel(gaussians.max_sh_degree)
@@ -149,10 +155,64 @@ def random_knn_score(points, npoints, score, k=32):
     sampled_points = points[sampled_idx]
     points = points.cpu()
     sampled_points = sampled_points.cpu()
-    dist = torch.cdist(sampled_points, points)
-    knn_idx = torch.topk(dist, k, largest=False, dim=-1)[1]
-    knn_idx = knn_idx.cuda()
+    
+    # 批量处理距离计算以避免内存问题
+    batch_size = 1000  # 每批处理1000个采样点
+    knn_idx_list = []
+    
+    for i in range(0, len(sampled_points), batch_size):
+        batch_end = min(i + batch_size, len(sampled_points))
+        batch_sampled = sampled_points[i:batch_end]
+        
+        # 计算当前批次的距离
+        batch_dist = torch.cdist(batch_sampled, points)
+        batch_knn_idx = torch.topk(batch_dist, k, largest=False, dim=-1)[1]
+        knn_idx_list.append(batch_knn_idx)
+    
+    # 合并所有批次的结果
+    knn_idx = torch.cat(knn_idx_list, dim=0).cuda()
 
+    # knn select
+    knn_score = score[knn_idx]  # (npoints, k)
+    score_knn_sort_idx = torch.argsort(
+        knn_score, descending=True, dim=-1
+    )  # (npoints, k)
+
+    final_sampled_idx = set()
+
+    for i in range(npoints):
+        for j in score_knn_sort_idx[i]:
+            idx = knn_idx[i, j].item()  
+            if idx not in final_sampled_idx: 
+                final_sampled_idx.add(idx)  
+                break  
+
+    return torch.tensor(list(final_sampled_idx)).cuda()
+
+
+def random_knn_score_efficient(points, npoints, score, k=32):
+    """
+    内存高效的 KNN 实现，使用 sklearn 的 NearestNeighbors
+    """
+    if not SKLEARN_FOUND:
+        print("Warning: sklearn not found, falling back to batched torch implementation")
+        return random_knn_score(points, npoints, score, k)
+    
+    sampled_idx = torch.randperm(points.shape[0])[:npoints]
+    sampled_points = points[sampled_idx]
+    
+    # 转换为 numpy 进行高效的近邻搜索
+    points_np = points.cpu().detach().numpy()
+    sampled_points_np = sampled_points.cpu().detach().numpy()
+    
+    # 使用 sklearn 的 NearestNeighbors，内存效率更高
+    nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto', metric='euclidean')
+    nbrs.fit(points_np)
+    
+    # 批量查找最近邻
+    distances, knn_idx = nbrs.kneighbors(sampled_points_np)
+    knn_idx = torch.from_numpy(knn_idx).cuda()
+    
     # knn select
     knn_score = score[knn_idx]  # (npoints, k)
     score_knn_sort_idx = torch.argsort(
@@ -252,7 +312,7 @@ def matching_oriented_sample(
     score_num[score_num == 0] = 1  # avoid divide by zero
     score_avg = score_sum / score_num
 
-    sampled_idx = random_knn_score(gaussians.get_xyz, num, score_avg, k=k)
+    sampled_idx = random_knn_score_efficient(gaussians.get_xyz, num, score_avg, k=k)
     sampled_idx = torch.unique(sampled_idx)
     return sampled_idx, score_avg, score_num
 

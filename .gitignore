@@ -176,5 +176,7 @@ cython_debug/
 
 datasets/7scenes
 datasets/cambridge
+datasets/mipnerf360
 results/
-map_*/
+map_*
+analyze/

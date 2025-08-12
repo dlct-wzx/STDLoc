@@ -142,7 +142,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, feature_type, images, eval, images_to_read=None):
+def readColmapSceneInfo(path, feature_type, images, eval, images_to_read=None, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -168,7 +168,11 @@ def readColmapSceneInfo(path, feature_type, images, eval, images_to_read=None):
             test_images = f.readlines()
             test_images = [x.split(" ")[0] for x in test_images if x[0] != '#']
     else:
-        test_images = []
+        # mipnerf360
+        test_images = os.listdir(os.path.join(path, "images"))
+        test_images = sorted(test_images)
+        test_images = [c for idx, c in enumerate(test_images) if idx % llffhold == 0]
+
     
     if images_to_read is None:
         images_to_read = None if not eval else test_images
