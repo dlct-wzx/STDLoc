@@ -187,6 +187,8 @@ def readColmapSceneInfo(path, feature_type, images, eval, images_to_read=None, l
         loc_feature_dim = 256
     elif feature_type == 'r2d2':
         loc_feature_dim = 128
+    elif feature_type == 'vggt':
+        loc_feature_dim = 128
 
     if eval:
         train_cam_infos = []

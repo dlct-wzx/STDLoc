@@ -162,7 +162,6 @@ def training(
             gt_image[sky_mask.repeat(3, 1, 1) == False] = 1  # 全白
 
         Ll1 = l1_loss(image, gt_image)
-
         if feature_map is not None:
             gt_feature_map = feature_extractor(original_image[None])["feature_map"][0]
 
