@@ -135,10 +135,16 @@ def calculate_match_score(
     
     # 计算Gaussian球特征与图片颜色的ΔE差异
     im_rgb = gt_image[:, xy[1], xy[0]].T  # 转置为 (N_visible, 3)
-    rgb_score = calculate_delta_e(gs_rgb, im_rgb)
+    rgb_delta_e = calculate_delta_e(gs_rgb, im_rgb)
     
     # 计算Gaussian球深度与图片深度的差异
-    depth_score = torch.abs(depths - gt_depth[xy[1], xy[0]])
+    depth_diff = torch.abs(depths - gt_depth[xy[1], xy[0]])
+    
+    rgb_sigma = 10.0  
+    rgb_score = torch.exp(-rgb_delta_e / rgb_sigma)
+    
+    depth_sigma = 1.0  
+    depth_score = torch.exp(-depth_diff / depth_sigma)
     
     return rgb_score, depth_score, visible_mask
 
@@ -269,6 +275,80 @@ def random_knn_score_efficient(points, npoints, score, k=32):
     return torch.tensor(list(final_sampled_idx)).cuda()
 
 
+def random_knn_score_color_diverse(points, npoints, score, colors, k=32, color_weight=0.5, use_lab=True):
+    """
+    基于KNN的评分+颜色多样性联合采样。
+    - points: (N,3) 空间坐标
+    - npoints: 目标采样数
+    - score: (N,) 每点分数（越大越好）
+    - colors: (N,3) RGB ∈[0,1]
+    - k: 每个种子对应的空间近邻数
+    - color_weight: 颜色多样性权重，越大越偏好多样性
+    - use_lab: 若可用，使用LAB空间计算ΔE
+    """
+    if color_weight <= 0:
+        return random_knn_score_efficient(points, npoints, score, k)
+
+    sampled_idx = torch.randperm(points.shape[0])[:npoints]
+    sampled_points = points[sampled_idx]
+
+    # 近邻搜索（优先用 sklearn，更省内存）
+    if SKLEARN_FOUND:
+        points_np = points.detach().cpu().numpy()
+        sampled_points_np = sampled_points.detach().cpu().numpy()
+        nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto', metric='euclidean')
+        nbrs.fit(points_np)
+        _, knn_idx_np = nbrs.kneighbors(sampled_points_np)
+        knn_idx = torch.from_numpy(knn_idx_np).to(points.device)
+    else:
+        points_cpu = points.detach().cpu()
+        sampled_points_cpu = sampled_points.detach().cpu()
+        batch_size = 1000
+        knn_idx_list = []
+        for i in range(0, len(sampled_points_cpu), batch_size):
+            batch_end = min(i + batch_size, len(sampled_points_cpu))
+            batch_sampled = sampled_points_cpu[i:batch_end]
+            batch_dist = torch.cdist(batch_sampled, points_cpu)
+            batch_knn_idx = torch.topk(batch_dist, k, largest=False, dim=-1)[1]
+            knn_idx_list.append(batch_knn_idx)
+        knn_idx = torch.cat(knn_idx_list, dim=0).to(points.device)
+
+    # 预计算颜色空间
+    colors = colors.clamp(0, 1)
+    if use_lab and SKIMAGE_FOUND:
+        colors_np = colors.detach().cpu().numpy()
+        lab_np = color.rgb2lab(colors_np)
+        lab_colors = torch.tensor(lab_np, device=points.device, dtype=colors.dtype)
+    else:
+        lab_colors = colors
+
+    final_sampled_idx = set()
+
+    for i in range(npoints):
+        group = knn_idx[i]  # (k,)
+        s = score[group]
+        # 组内归一化，避免尺度偏置
+        s_norm = (s - s.min()) / (s.max() - s.min() + 1e-8)
+
+        c = lab_colors[group].float()
+        if k > 1:
+            dmat = torch.cdist(c, c, p=2)                 # (k,k)
+            contrast = dmat.sum(dim=1) / (k - 1)          # 平均ΔE，越大越“与众不同”
+        else:
+            contrast = torch.zeros_like(s, dtype=torch.float32, device=s.device)
+        c_norm = (contrast - contrast.min()) / (contrast.max() - contrast.min() + 1e-8)
+
+        obj = (1.0 - color_weight) * s_norm + color_weight * c_norm
+        order = torch.argsort(obj, descending=True)
+        for j in order:
+            idx = group[j].item()
+            if idx not in final_sampled_idx:
+                final_sampled_idx.add(idx)
+                break
+
+    return torch.tensor(list(final_sampled_idx), device=points.device)
+
+
 def matching_oriented_sample(
     scene,
     gaussians,
@@ -278,6 +358,7 @@ def matching_oriented_sample(
     num=16384,
     k=32,
     weight=0.5,
+    color_diverse_weight=0.0,
 ):
     viewpoint_stack = scene.getTrainCameras().copy()
     rgb_score_sum = torch.zeros(    # 每个Gaussian可见次数的和
@@ -380,7 +461,13 @@ def matching_oriented_sample(
     score_num[score_num == 0] = 1  # avoid divide by zero
     score_avg = score_avg / score_num # 每个点的平均分数（若该点从未出现为0）      
 
-    # knn采样
-    sampled_idx = random_knn_score_efficient(gaussians.get_xyz, num, score_avg, k=k)
+    # knn采样（可选颜色多样性）
+    if color_diverse_weight > 0.0:
+        gs_colors = gaussians.get_features[:,:3].squeeze().clamp(0, 1)
+        sampled_idx = random_knn_score_color_diverse(
+            gaussians.get_xyz, num, score_avg, gs_colors, k=k, color_weight=color_diverse_weight
+        )
+    else:
+        sampled_idx = random_knn_score_efficient(gaussians.get_xyz, num, score_avg, k=k)
     sampled_idx = torch.unique(sampled_idx)
     return sampled_idx, score_avg, score_num
