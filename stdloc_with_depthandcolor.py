@@ -1,0 +1,726 @@
+import datetime
+import json
+import os
+import pickle
+from argparse import ArgumentParser
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+from tqdm import tqdm
+from time import time
+from pytorch_model_summary import summary
+from thop import profile
+from thop import clever_format
+from skimage import color
+
+from arguments import ModelParams, PipelineParams, get_combined_args
+from encoders.feature_extractor import FeatureExtractor
+from gaussian_renderer import render_from_pose_gsplat
+from scene import Scene
+from scene.gaussian_model import GaussianModel, GaussianModel_2dgs
+from scene.kpdetector import KpDetector, simple_nms
+from utils.graphics_utils import fov2focal
+from utils.image_utils import get_resolution_from_longest_edge
+from utils.pose_utils import cal_pose_error, solve_pose
+
+# 全局变量
+feature_extraction_time = 0.0
+ssd_time = 0.0
+sparse_matching_time = 0.0
+pose_estimation_sparse_time = 0.0
+render_time = 0.0
+dense_matching_time = 0.0
+pose_estimation_dense_time = 0.0
+
+
+# TODO use interpolate
+def lift_2d_to_3d(points2d, intrinsic, Twc, depth_map):
+    """
+    points2d: tensor [N, 2]
+    intrinsic: tensor [3, 3]
+    Twc: tensor [4, 4]
+    depth_map: tensor [H, W]
+    """
+    device = points2d.device
+    depth_idx = points2d.long()
+    points2d = points2d + 0.5
+    points2d_homo = torch.cat(
+        [points2d, torch.ones((points2d.shape[0], 1), device=device)], dim=1
+    )
+    points3d_camera = (
+        torch.inverse(intrinsic)
+        @ points2d_homo.T
+        * depth_map[depth_idx[:, 1], depth_idx[:, 0]]
+    )  # [3, N]
+    points3d_camera_homo = torch.cat(
+        [
+            points3d_camera,
+            torch.ones((1, points3d_camera.shape[-1]), device=device),
+        ],
+        dim=0,
+    )  # [4, N]
+    points3d_world = Twc @ points3d_camera_homo  # [4, N]
+    points3d = points3d_world.T[:, :3]
+    return points3d
+
+
+def sample_gaussians(gaussians: GaussianModel, idx_sampled):
+    sampled_gaussians = GaussianModel(3)
+    sampled_gaussians._xyz = gaussians._xyz[idx_sampled]
+    sampled_gaussians._loc_feature = gaussians._loc_feature[idx_sampled]
+    sampled_gaussians._scaling = gaussians._scaling[idx_sampled]
+    sampled_gaussians._opacity = gaussians._opacity[idx_sampled]
+    sampled_gaussians._rotation = gaussians._rotation[idx_sampled]
+    sampled_gaussians._features_dc = gaussians._features_dc[idx_sampled]
+    sampled_gaussians._features_rest = gaussians._features_rest[idx_sampled]
+    return sampled_gaussians
+
+
+def mnn_match(corr_matrix, thr=-1):
+    """
+    corr_matrix: torch.Tensor, shape (B, N, M)
+    """
+    mask = corr_matrix > thr
+    mask = (
+        mask
+        * (corr_matrix == corr_matrix.max(dim=-1, keepdim=True)[0])
+        * (corr_matrix == corr_matrix.max(dim=-2, keepdim=True)[0])
+    )
+    b_ids, i_ids, j_ids = torch.where(mask)
+    return b_ids.squeeze(), i_ids.squeeze(), j_ids.squeeze()
+
+
+def topk_match(corr_matrix, topk, thr=-1):
+    """
+    corr_matrix: torch.Tensor, shape (B, N, M)
+    """
+    N_im = corr_matrix.shape[-2]
+    val, idx = torch.topk(corr_matrix, topk, dim=-1)
+    val_flattened = val.flatten(1)
+    idx_flattened = idx.flatten(1)
+    mask = val_flattened > thr
+    arange_tensor = torch.arange(N_im, device=corr_matrix.device)
+    idx_im = arange_tensor[None].repeat(corr_matrix.shape[0], topk)[mask]
+    idx_gs = idx_flattened[mask]
+    val = val_flattened[mask]
+
+    return idx_im, idx_gs, val
+
+
+def dual_softmax(corr_matrix, temp=1):
+    corr_matrix = corr_matrix / temp
+    corr_matrix = F.softmax(corr_matrix, dim=-2) * F.softmax(corr_matrix, dim=-1)
+    return corr_matrix
+
+
+def get_intrinsic(fovx, fovy, width, height):
+    focalX = fov2focal(fovx, width)
+    focalY = fov2focal(fovy, height)
+    K = np.array(
+        [
+            [focalX, 0.0, width / 2],
+            [0.0, focalY, height / 2],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return K
+
+class STDLoc:
+    def __init__(self, gaussians, config):
+        self.gaussians = gaussians
+        self.config = config
+
+        sampled_idx = pickle.load(
+            open(
+                os.path.join(config["model_path"], config["sparse"]["landmark_path"]),
+                "rb",
+            )
+        )
+        self.landmarks = sample_gaussians(gaussians, sampled_idx)
+
+        self.feature_extractor = FeatureExtractor(config["feature_type"]).cuda().eval()
+        self.longest_edge = config["longest_edge"]
+
+        self.detector = KpDetector(self.feature_extractor.feature_dim)
+        self.detector.load_state_dict(
+            torch.load(
+                os.path.join(config["model_path"], config["sparse"]["detector_path"])
+            )
+        )
+        self.detector.eval().cuda()
+
+    @torch.no_grad()
+    def localize(self, query_image, fovx, fovy):
+        """
+        image: torch.Tensor, shape (3, H, W)
+        """
+        # Get feature
+        start_time = time()
+        query_fine_feature_map, query_coarse_feature_map, query_fine_depth_map, query_coarse_depth_map, query_fine_image, query_coarse_image = self.get_feature_map(
+            query_image
+        )
+        global feature_extraction_time
+        feature_extraction_time += time() - start_time
+        # Sparse stage
+        sparse_result = self.loc_sparse(query_fine_feature_map, query_fine_depth_map, query_fine_image, fovx, fovy)
+
+        return {"sparse": sparse_result}
+        
+        # Dense stage
+        pose_w2c = sparse_result["pose_w2c"]
+        dense_results = []
+        for iter in range(self.config["dense"]["iters"]):
+            dense_result = self.loc_dense(
+                query_coarse_feature_map, query_fine_feature_map, pose_w2c, fovx, fovy
+            )
+            pose_w2c = dense_result["pose_w2c"]
+            
+            dense_results.append(dense_result)
+
+        return {"sparse": sparse_result, "dense": dense_results}
+
+    @torch.no_grad()
+    def loc_sparse(self, query_feature_map, query_depth_map, query_image, fovx, fovy):
+        """
+        feature_map: torch.Tensor, shape (C, H, W)
+        """
+        # detect
+        start_time = time()
+        H, W = query_feature_map.shape[-2:]
+        heat_map = self.detector(query_feature_map)
+
+        kp_scores_after_nms = simple_nms(
+            heat_map, self.config["sparse"].get("nms", 4)
+        ).flatten()
+        global ssd_time
+        ssd_time += time() - start_time
+        start_time = time()
+        _, kp_ids = torch.topk(
+            kp_scores_after_nms, self.config["sparse"].get("detect_num", 2048)
+        )
+        pos_mask = kp_scores_after_nms > 0
+        kp_ids = kp_ids[pos_mask[kp_ids]]
+
+        kp_mask = torch.zeros_like(kp_scores_after_nms, dtype=torch.bool)
+        kp_mask[kp_ids] = True
+        
+        # sparse query depth
+        sampled_depths = query_depth_map.reshape(query_depth_map.shape[0], -1)[
+            :, kp_mask
+        ]
+        ###################################################################################
+        # sparse query features
+        sampled_features = query_feature_map.reshape(query_feature_map.shape[0], -1)[
+            :, kp_mask
+        ]
+        # sparse landmark features
+        landmark_features = F.normalize(
+            self.landmarks.get_loc_feature.squeeze(), dim=-1
+        )
+
+        # sparse match
+        corr_matrix_stage1 = torch.matmul(sampled_features.T, landmark_features.T)
+        ###################################################################################
+        # sparse query image
+        # sampled_images = query_image.reshape(query_image.shape[0], -1)[
+        #     :, kp_mask
+        # ]
+        # # 转置为 [N_keypoints, 3] 格式，符合 skimage.color.rgb2lab 的期望
+        # sampled_rgb = sampled_images.T.detach().cpu().numpy()  # [N_keypoints, 3]
+        # sampled_rgb = color.rgb2lab(sampled_rgb[..., None, :]).squeeze()
+        # sampled_rgb = torch.tensor(sampled_rgb, device=sampled_images.device).T  # 转回 [3, N_keypoints]
+        
+        # # 获取完整的landmark信息（不用kp_mask索引）
+        # landmark_xyz = self.landmarks.get_xyz  # [N_landmarks, 3]
+        
+        # # landmark RGB颜色
+        # landmark_rgb_raw = self.landmarks.get_features[:,0].squeeze()  # [N_landmarks, 3]
+        # # 转换为LAB颜色空间
+        # landmark_rgb_raw = landmark_rgb_raw.detach().cpu().numpy()
+        # landmark_rgb = color.rgb2lab(landmark_rgb_raw[..., None, :]).squeeze()
+        # landmark_rgb = torch.tensor(landmark_rgb, device=self.landmarks.get_xyz.device)  # [N_landmarks, 3]
+        
+        # # 第一阶段：颜色匹配（不使用深度约束）
+        
+        # # 1. 颜色匹配
+        # sampled_rgb_transposed = sampled_rgb.T  # [N_query, 3]
+        
+        # # 计算LAB色彩空间的欧氏距离
+        # sampled_rgb_expanded = sampled_rgb_transposed.unsqueeze(1)  # [N_query, 1, 3]
+        # landmark_rgb_expanded = landmark_rgb.unsqueeze(0)  # [1, N_landmarks, 3]
+        # # color_distances = torch.norm(sampled_rgb_expanded - landmark_rgb_expanded, dim=2)  # [N_query, N_landmarks]
+        # color_distances = torch.sqrt(
+        #     torch.sum((sampled_rgb_expanded - landmark_rgb_expanded) ** 2, dim=-1)
+        # )
+        
+        # # 转换为相似度（距离越小相似度越高）
+        # corr_matrix_stage1 = 1.0 / (1.0 + color_distances)  # [N_query, N_landmarks]
+        
+        print(corr_matrix_stage1.shape)
+        # 2. 获得初步姿态估计
+        # dual softmax for stage 1
+        if self.config["sparse"]["dual_softmax"] is True:
+            corr_matrix_stage1 = dual_softmax(
+                corr_matrix_stage1, temp=self.config["sparse"]["dual_softmap_temp"]
+            )
+
+        # 第一阶段匹配
+        if self.config["sparse"]["mnn_match"] is True:
+            b_ids_1, im_idx_1, gs_ids_1 = mnn_match(
+                corr_matrix_stage1[None], thr=self.config["sparse"]["threshold"]
+            )
+        else:
+            im_idx_1, gs_ids_1, val_1 = topk_match(
+                corr_matrix_stage1[None],
+                self.config["sparse"]["topk"],
+                thr=self.config["sparse"]["threshold"],
+            )
+
+        # 获得初步姿态估计
+        p2d = torch.stack([torch.arange(H * W) % W, torch.arange(H * W) // W], dim=1)
+        p2d_stage1 = p2d[kp_mask.cpu()][im_idx_1.cpu()].numpy()
+        p3d_stage1 = self.landmarks.get_xyz[gs_ids_1].cpu().numpy()
+        
+        K = get_intrinsic(fovx, fovy, W, H)
+        pose_w2c_initial, inliers_stage1 = solve_pose(
+            p2d_stage1 + 0.5,
+            p3d_stage1,
+            K,
+            self.config["sparse"]["solver"],
+            self.config["sparse"]["reprojection_error"],
+            self.config["sparse"]["confidence"],
+            self.config["sparse"]["max_iterations"],
+            self.config["sparse"]["min_iterations"],
+        )
+        
+        # 如果第一阶段匹配失败，直接返回
+        if pose_w2c_initial is None or inliers_stage1.shape[0] < 4:
+            print("[警告] 第一阶段姿态估计失败，使用颜色+特征匹配结果")
+            global sparse_matching_time 
+            sparse_matching_time += time() - start_time
+            return {
+                "pose_w2c": pose_w2c_initial if pose_w2c_initial is not None else np.eye(4),
+                "inliers": int(inliers_stage1.shape[0]) if inliers_stage1 is not None else 0,
+            }
+
+        return {
+                "pose_w2c": pose_w2c_initial if pose_w2c_initial is not None else np.eye(4),
+                "inliers": int(inliers_stage1.shape[0]) if inliers_stage1 is not None else 0,
+            }
+        # 第二阶段：使用深度约束进行精细匹配
+        
+        # 将世界坐标系的landmark坐标转换到相机坐标系
+        landmark_xyz_homo = torch.cat([
+            landmark_xyz, 
+            torch.ones((landmark_xyz.shape[0], 1), device=landmark_xyz.device)
+        ], dim=1)  # [N_landmarks, 4]
+        
+        # 转换到相机坐标系
+        pose_w2c_tensor = torch.tensor(pose_w2c_initial, device=landmark_xyz.device, dtype=torch.float32)
+        landmark_xyz_camera = (pose_w2c_tensor @ landmark_xyz_homo.T).T  # [N_landmarks, 4]
+        landmark_depth_camera = landmark_xyz_camera[:, 2]  # Z坐标作为相机坐标系深度 [N_landmarks]
+        
+        # 计算深度差异（现在都在相机坐标系下）
+        # sampled_depths: [1, N_query] -> [N_query]
+        # landmark_depth_camera: [N_landmarks]
+        sampled_depths_flat = sampled_depths.squeeze(0)  # [N_query]
+        
+        # 扩展维度用于广播
+        sampled_depths_expanded = sampled_depths_flat.unsqueeze(1)  # [N_query, 1]
+        landmark_depth_expanded = landmark_depth_camera.unsqueeze(0)  # [1, N_landmarks]
+        
+        depth_diff = torch.abs(sampled_depths_expanded - landmark_depth_expanded)  # [N_query, N_landmarks]
+        depth_threshold = 0.05  # 深度差异阈值，可以调整
+        depth_mask = depth_diff < depth_threshold  # [N_query, N_landmarks]
+        print(depth_mask.sum())
+        # 第二阶段综合匹配（颜色 + 深度约束）
+        # depth_mask 和 corr_matrix_stage1 都是 [N_query, N_landmarks] 格式
+        corr_matrix = corr_matrix_stage1 * depth_mask.float()
+        
+        # dual softmax for stage 2
+        if self.config["sparse"]["dual_softmax"] is True:
+            corr_matrix = dual_softmax(
+                corr_matrix, temp=self.config["sparse"]["dual_softmap_temp"]
+            )
+
+        # 第二阶段匹配
+        if self.config["sparse"]["mnn_match"] is True:
+            b_ids, im_idx, gs_ids = mnn_match(
+                corr_matrix[None], thr=self.config["sparse"]["threshold"]
+            )
+        else:
+            im_idx, gs_ids, val = topk_match(
+                corr_matrix[None],
+                self.config["sparse"]["topk"],
+                thr=self.config["sparse"]["threshold"],
+            )
+
+        # 最终姿态估计
+        p2d_final = p2d[kp_mask.cpu()][im_idx.cpu()].numpy()
+        p3d_final = self.landmarks.get_xyz[gs_ids].cpu().numpy()
+        
+        pose_w2c, inliers = solve_pose(
+            p2d_final + 0.5,
+            p3d_final,
+            K,
+            self.config["sparse"]["solver"],
+            self.config["sparse"]["reprojection_error"],
+            self.config["sparse"]["confidence"],
+            self.config["sparse"]["max_iterations"],
+            self.config["sparse"]["min_iterations"],
+        )
+        global pose_estimation_sparse_time
+        pose_estimation_sparse_time += time() - start_time
+        return {
+            "pose_w2c": pose_w2c,
+            "inliers": int(inliers.shape[0]),
+        }
+
+    @torch.no_grad()
+    def loc_dense(
+        self, coarse_query_feature_map, fine_query_feature_map, pose_w2c, fovx, fovy
+    ):
+        """
+        coarse_feature_map: torch.Tensor, shape (C, H//8, W//8)
+        fine_feature_map: torch.Tensor, shape (C, H, W)
+        """
+        start_time = time()
+        Hf, Wf = fine_query_feature_map.shape[-2:]
+        Hc, Wc = coarse_query_feature_map.shape[-2:]
+        W = Hf // Hc  # window size 8 * 8
+        C = self.feature_extractor.feature_dim
+        WW = W * W
+        overlap_size = 0  
+        K = get_intrinsic(fovx, fovy, Wf, Hf)
+
+        # 使用gsplat渲染
+        render_pkg = render_from_pose_gsplat(
+            self.gaussians,
+            torch.tensor(pose_w2c, device="cuda"),
+            fovx,
+            fovy,
+            Wf,
+            Hf,
+            render_mode="RGB+ED",
+            norm_feat_bf_render=self.config["dense"]["norm_before_render"],
+            rasterize_mode="antialiased",
+        )
+        # 获取深度图
+        depth = render_pkg["depth"].squeeze()
+        # 获取特征图
+        fine_rendered_feature_map = render_pkg["feature_map"]
+
+        if (fine_rendered_feature_map == 0).all():
+            print("[skip] Rendered feature map is all zero")
+            return {"pose_w2c": pose_w2c, "inliers": 0}
+        # 八倍下采样
+        coarse_rendered_feature_map = F.interpolate(
+            fine_rendered_feature_map[None],
+            size=(Hc, Wc),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+        coarse_rendered_feature_map = F.normalize(coarse_rendered_feature_map, dim=0)
+        global render_time
+        render_time += time() - start_time
+        start_time = time()
+        # coarse match
+        coarse_corr_matrix = torch.matmul(
+            coarse_query_feature_map.permute(1, 2, 0).reshape(1, -1, C),
+            coarse_rendered_feature_map.reshape(1, C, -1),
+        )  # 1, N, M
+
+        coarse_corr_matrix = dual_softmax(
+            coarse_corr_matrix, temp=self.config["dense"]["coarse_dual_softmax_temp"]
+        )
+
+        c_b_ids, c_i_ids, c_j_ids = mnn_match(
+            coarse_corr_matrix, thr=self.config["dense"]["coarse_threshold"]
+        )
+
+        if c_i_ids.dim() == 0:
+            print("[skip] Failed in coarse match")
+            return {"pose_w2c": pose_w2c, "inliers": 0}
+        elif c_i_ids.shape[0] < 3:
+            print("[skip] Failed in coarse match")
+            return {"pose_w2c": pose_w2c, "inliers": 0}
+        
+        # fine match
+        # 为每个匹配点创建8*8的特征窗口
+        query_feature_windows = (
+            F.unfold(
+                fine_query_feature_map, (W, W), stride=W, padding=overlap_size // 2
+            )
+            .reshape(1, C, WW, -1)[c_b_ids, :, :, c_i_ids]
+            .permute(0, 2, 1)
+        )  # B, N, C
+        rendered_feature_windows = (
+            F.unfold(
+                fine_rendered_feature_map, (W, W), stride=W, padding=overlap_size // 2
+            )
+            .reshape(1, C, WW, -1)[c_b_ids, :, :, c_j_ids]
+            .permute(0, 2, 1)
+        )  # B, M, C
+
+        fine_corr_matrix = torch.matmul(
+            query_feature_windows, rendered_feature_windows.transpose(-2, -1)
+        )  # B, N, M
+
+        fine_corr_matrix = dual_softmax(
+            fine_corr_matrix, temp=self.config["dense"]["fine_dual_softmax_temp"]
+        )
+
+        f_b_ids, f_i_ids, f_j_ids = mnn_match(
+            fine_corr_matrix, thr=self.config["dense"]["fine_threshold"]
+        )
+
+        if f_i_ids.dim() == 0:
+            print("[skip] Failed in fine match")
+            return {"pose_w2c": pose_w2c, "inliers": 0}
+        elif f_i_ids.shape[0] < 3:
+            print("[skip] Failed in fine match")
+            return {"pose_w2c": pose_w2c, "inliers": 0}
+
+        query_p2d = torch.stack(
+            [
+                c_i_ids[f_b_ids] % Wc * W + f_i_ids % W,
+                c_i_ids[f_b_ids] // Wc * W + f_i_ids // W,
+            ],
+            dim=1,
+        ).float()
+        rendered_p2d = torch.stack(
+            [
+                c_j_ids[f_b_ids] % Wc * W + f_j_ids % W,
+                c_j_ids[f_b_ids] // Wc * W + f_j_ids // W,
+            ],
+            dim=1,
+        ).float()
+
+        pose_c2w = np.linalg.inv(pose_w2c)
+        p3d = lift_2d_to_3d(rendered_p2d, torch.tensor(K, device="cuda"), torch.tensor(pose_c2w, device="cuda"), depth)
+        global dense_matching_time
+        dense_matching_time += time() - start_time
+        start_time = time()
+        # Solve pose
+        query_p2d = query_p2d.cpu().numpy()
+        p3d = p3d.cpu().numpy()
+        pose_w2c, inliers = solve_pose(
+            query_p2d + 0.5,
+            p3d,
+            K,
+            self.config["dense"]["solver"],
+            self.config["dense"]["reprojection_error"],
+            self.config["dense"]["confidence"],
+            self.config["dense"]["max_iterations"],
+            self.config["dense"]["min_iterations"],
+        )
+        global pose_estimation_dense_time
+        pose_estimation_dense_time += time() - start_time
+        return {
+            "pose_w2c": pose_w2c,
+            "inliers": int(inliers.shape[0]),
+        }
+
+    def get_feature_map(self, image):
+        """
+        image: torch.Tensor, shape (3, H, W)
+        """
+        fine_resolution = get_resolution_from_longest_edge(
+            image.shape[-2], image.shape[-1], self.longest_edge
+        )
+        # 八倍下采样
+        coarse_resolution = (fine_resolution[0] // 8, fine_resolution[1] // 8)
+
+        results = self.feature_extractor(image[None])
+        feature_map = results["feature_map"]  # 1, C, H, W
+        depth_map = results["depth_map"][0]  # 1, H, W
+        
+        # Get feature
+        coarse_feature_map = F.interpolate(
+            feature_map, size=coarse_resolution, mode="bilinear", align_corners=False
+        )[0]
+        coarse_feature_map = F.normalize(coarse_feature_map, p=2, dim=0)
+        fine_feature_map = F.interpolate(
+            feature_map, size=fine_resolution, mode="bilinear", align_corners=False
+        )[0]
+        fine_feature_map = F.normalize(fine_feature_map, p=2, dim=0)
+        
+        # Get depth
+        coarse_depth_map = F.interpolate(
+            depth_map.permute(0, 3, 1, 2), size=coarse_resolution, mode="bilinear", align_corners=False
+        )[0]
+        fine_depth_map = F.interpolate(
+            depth_map.permute(0, 3, 1, 2), size=fine_resolution, mode="bilinear", align_corners=False
+        )[0]
+        
+        # Get image
+        # 为图像添加批次维度：[3, H, W] -> [1, 3, H, W]
+        image_4d = image.unsqueeze(0)  # 添加批次维度
+        coarse_image = F.interpolate(
+            image_4d, size=coarse_resolution, mode="bilinear", align_corners=False
+        )[0]
+        fine_image = F.interpolate(
+            image_4d, size=fine_resolution, mode="bilinear", align_corners=False
+        )[0]
+
+        return fine_feature_map, coarse_feature_map, fine_depth_map, coarse_depth_map, fine_image, coarse_image
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description="Testing script parameters")
+    model = ModelParams(parser, sentinel=True)
+    pipeline = PipelineParams(parser)
+    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--cfg", default=None, type=str)
+    parser.add_argument("--prefix", default=None, type=str)
+    args = get_combined_args(parser)
+    args.eval = True
+
+    if hasattr(args, "prefix"):
+        output_path = f"results/{args.prefix}-{args.model_path.replace('/', '_')}-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        output_path = f"results/{args.model_path.replace('/', '_')}-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    print("Output path:", output_path)
+    os.makedirs(output_path, exist_ok=True)
+
+    # Load feature gaussian scene
+    dataset = model.extract(args)
+    if dataset.gaussian_type == "3dgs":
+        gaussians = GaussianModel(dataset.sh_degree)
+    elif dataset.gaussian_type == "2dgs":
+        gaussians = GaussianModel_2dgs(dataset.sh_degree)
+    else:
+        raise ValueError("Gaussian type not supported")
+
+    scene = Scene(
+        dataset,
+        gaussians,
+        load_iteration=args.iteration,
+        shuffle=False,
+        preload_cameras=False,
+    )
+
+    # Set up config
+    config = yaml.load(open(args.cfg), Loader=yaml.FullLoader)
+        
+    config["dense"]["norm_before_render"] = dataset.norm_before_render
+    config["feature_type"] = dataset.feature_type
+    config["longest_edge"] = dataset.longest_edge
+    config["model_path"] = dataset.model_path
+
+    yaml.dump(config, open(os.path.join(output_path, os.path.basename(args.cfg)), "w"))
+
+    # loc main
+    stdloc = STDLoc(gaussians, config)
+
+    test_cameras = scene.getTestCameras()
+
+    results = []
+    sparse_aes = []
+    sparse_tes = []
+    sparse_inliers = []
+    # dense_aes = []
+    # dense_tes = []
+    # dense_inliers = []
+    all_time = 0
+
+    for idx, camera_info in enumerate(tqdm(test_cameras, desc="STDLoc")):
+        print("\nLocalize image:", camera_info.image_name)
+        gt_w2c = camera_info.world_view_transform.transpose(0, 1).cpu().numpy()
+        print(camera_info.T)
+        query_image = camera_info.original_image.to("cuda")
+        fovx = camera_info.FoVx
+        fovy = camera_info.FoVy
+        # localization
+        start_time = time()
+        loc_res = stdloc.localize(query_image, fovx, fovy)
+        all_time += time() - start_time
+
+        # evaluation
+        sparse_ae, sparse_te = cal_pose_error(loc_res["sparse"]["pose_w2c"], gt_w2c)
+        if float(sparse_te) > 1000:
+            continue
+        sparse_aes.append(sparse_ae)
+        sparse_tes.append(sparse_te)
+        sparse_inliers.append(loc_res["sparse"]["inliers"])
+        loc_res["sparse_AE"] = float(sparse_ae)
+        loc_res["sparse_TE"] = float(sparse_te)
+
+        # dense_ae, dense_te = cal_pose_error(loc_res["dense"][-1]["pose_w2c"], gt_w2c) # degree, cm
+        # dense_aes.append(dense_ae)
+        # dense_tes.append(dense_te)
+        # dense_inliers.append(loc_res["dense"][-1]["inliers"])
+        # print(f"AE: {dense_ae:.3f}deg, TE: {dense_te:.3f}cm, inliers: {loc_res['dense'][-1]['inliers']}")
+
+        # loc_res["gt_pose_w2c"] = gt_w2c.tolist()
+        # loc_res["dense_AE"] = float(dense_ae)
+        # loc_res["dense_TE"] = float(dense_te)
+
+        # results.append(loc_res)
+
+    # get summary
+    sparse_aes = np.array(sparse_aes)
+    sparse_tes = np.array(sparse_tes)
+    # dense_aes = np.array(dense_aes)
+    # dense_tes = np.array(dense_tes)
+
+    results_summary = {
+        "model_path": dataset.model_path,
+        "sparse": {
+            "median_ae": float(np.median(sparse_aes)),
+            "median_te": float(np.median(sparse_tes)),
+            "mean_ae": float(np.mean(sparse_aes)),
+            "mean_te": float(np.mean(sparse_tes)),
+            "recall_5m_10d": float(((sparse_aes <= 10) & (sparse_tes <= 500)).sum()
+            / len(sparse_aes)),
+            "recall_2m_5d": float(((sparse_aes <= 5) & (sparse_tes <= 200)).sum()
+            / len(sparse_aes)),
+            "recall_5cm_5d": float(((sparse_aes <= 5) & (sparse_tes <= 5)).sum()
+            / len(sparse_aes)),
+            "recall_2cm_2d": float(((sparse_aes <= 2) & (sparse_tes <= 2)).sum()
+            / len(sparse_aes)),
+            "avg_inliers": float(np.array(sparse_inliers).mean()),
+        },
+        # "dense": {
+        #     "median_ae": float(np.median(dense_aes)),
+        #     "median_te": float(np.median(dense_tes)),
+        #     "mean_ae": float(np.mean(dense_aes)),
+        #     "mean_te": float(np.mean(dense_tes)),
+        #     "recall_5m_10d": float(((dense_aes <= 10) & (dense_tes <= 500)).sum()
+        #     / len(dense_aes)),
+        #     "recall_2m_5d": float(((dense_aes <= 5) & (dense_tes <= 200)).sum()
+        #     / len(dense_aes)),
+        #     "recall_5cm_5d": float(((dense_aes <= 5) & (dense_tes <= 5)).sum()
+        #     / len(dense_aes)),
+        #     "recall_2cm_2d": float(((dense_aes <= 2) & (dense_tes <= 2)).sum()
+        #     / len(dense_aes)),
+        #     "avg_inliers": float(np.array(dense_inliers).mean()),
+        # },
+        "per_image_time": all_time / len(test_cameras),
+        "fps": 1 / (all_time / len(test_cameras)),
+        "feature_extraction_time": feature_extraction_time / len(test_cameras),
+        "ssd_time": ssd_time / len(test_cameras),
+        "sparse_matching_time": sparse_matching_time / len(test_cameras),
+        "pose_estimation_sparse_time": pose_estimation_sparse_time / len(test_cameras),
+        # "render_time": render_time / len(test_cameras),
+        # "dense_matching_time": dense_matching_time / len(test_cameras),
+        # "pose_estimation_dense_time": pose_estimation_dense_time / len(test_cameras),
+    }
+    print("Result Summary:")
+    print(json.dumps(results_summary, indent=4))
+
+    json.dump(
+        results_summary, open(os.path.join(output_path, "summary.json"), "w"), indent=4
+    )
+
+    # for item in results:
+    #     item["sparse"]["pose_w2c"] = item["sparse"]["pose_w2c"].tolist()
+    #     for dense_item in item["dense"]:
+    #         dense_item["pose_w2c"] = dense_item["pose_w2c"].tolist()
+    # json.dump(results, open(os.path.join(output_path, "results.json"), "w"), indent=4)
+
+
+    print("Result are saved in", output_path)

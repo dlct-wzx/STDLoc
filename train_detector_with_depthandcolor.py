@@ -47,7 +47,7 @@ try:
 except ImportError:
     SKLEARN_FOUND = False
     
-from sample_gaussian_with_feature import get_sampled_gaussian, matching_oriented_sample, generate_gt_map
+from sample_gaussian_with_depthandcolor import get_sampled_gaussian, matching_oriented_sample, generate_gt_map
 
 
 def evaluate_detector(
@@ -213,7 +213,7 @@ def training_detector(
 ):
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-    feature_extractor = FeatureExtractor(scene.feature_type)
+    feature_extractor = FeatureExtractor(scene.feature_type).cuda().eval()
 
     render_visible_masks = {}
 

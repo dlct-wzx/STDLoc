@@ -5,6 +5,7 @@ from argparse import ArgumentParser, Namespace
 from random import randint
 
 import torch
+import numpy as np
 from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, get_combined_args
@@ -63,7 +64,8 @@ def calculate_delta_e(rgb1, rgb2):
         # skimage 需要形状为 (..., 3) 的数组
         lab1 = color.rgb2lab(rgb1_np[..., None, :]).squeeze()
         lab2 = color.rgb2lab(rgb2_np[..., None, :]).squeeze()
-        
+        # print(lab1.shape)
+        # print(lab2.shape)
         # 计算 ΔE76
         delta_e = torch.sqrt(
             torch.sum((torch.tensor(lab1, device=rgb1.device) - torch.tensor(lab2, device=rgb1.device)) ** 2, dim=-1)
@@ -74,7 +76,6 @@ def calculate_delta_e(rgb1, rgb2):
         delta_e = torch.sqrt(torch.sum((rgb1 - rgb2) ** 2, dim=-1))
     
     return delta_e
-
 
 def get_sampled_gaussian(gaussians: GaussianModel, idx_sampled):
     sampled_gaussians = GaussianModel(gaussians.max_sh_degree)
@@ -98,9 +99,10 @@ def calculate_match_score(
     K,
     render_visible_mask=None,   # 设置gaussian球的可见性
     img_mask=None,              # 设置图片中像素位置的可见性
+    confidence_threshold=0.5,
 ):
     xyz = gaussians.get_xyz
-    gs_rgb = gaussians.get_features[:,:3].squeeze()
+    gs_rgb = gaussians.get_features[:,0].squeeze()
     
     # project gaussians to image space
     xyz_homo = torch.cat([xyz, torch.ones(xyz.shape[0], 1, device=xyz.device)], dim=-1)
@@ -128,6 +130,16 @@ def calculate_match_score(
         img_mask_expand = torch.zeros_like(visible_mask, dtype=torch.bool)
         img_mask_expand[in_mask] = img_mask[0, visible_xy[1], visible_xy[0]]
         visible_mask = visible_mask & img_mask_expand
+    if gt_depth_confidence is not None:
+        # 获取可见高斯点的图像坐标
+        visible_xy = xy[:, in_mask]
+        # 对深度置信度进行归一化和阈值化
+        gt_depth_conf_norm = (gt_depth_confidence - gt_depth_confidence.min()) / (gt_depth_confidence.max() - gt_depth_confidence.min() + 1e-8)
+        gt_depth_conf_thresholded = gt_depth_conf_norm > confidence_threshold
+        # 根据高斯点的图像坐标采样置信度
+        conf_mask_expand = torch.zeros_like(visible_mask, dtype=torch.bool)
+        conf_mask_expand[in_mask] = gt_depth_conf_thresholded[0, visible_xy[1], visible_xy[0]]  # 使用第一个通道
+        visible_mask = visible_mask & conf_mask_expand
 
     xy = xy[:, visible_mask]
     depths = depths[visible_mask]
@@ -138,7 +150,7 @@ def calculate_match_score(
     rgb_delta_e = calculate_delta_e(gs_rgb, im_rgb)
     
     # 计算Gaussian球深度与图片深度的差异
-    depth_diff = torch.abs(depths - gt_depth[xy[1], xy[0]])
+    depth_diff = torch.abs(depths - gt_depth[0, xy[1], xy[0]])  # 使用第一个通道的深度值
     
     rgb_sigma = 10.0  
     rgb_score = torch.exp(-rgb_delta_e / rgb_sigma)
@@ -377,30 +389,29 @@ def matching_oriented_sample(
 
     for viewpoint_cam in tqdm(viewpoint_stack, desc="Match Score"):
         gt_image = viewpoint_cam.original_image.cuda()  # 图片  
-        
-        gt_depth = feature_extractor(gt_image[None])["depth_map"]  # 图片深度
-        gt_depth_confidence = feature_extractor(gt_image[None])["depth_conf"]  # 图片深度置信度
+        result = feature_extractor(gt_image[None])
+        gt_depth = result["depth_map"][0]  # 图片深度
+        gt_depth_confidence = result["depth_conf"][0]  # 图片深度置信度
         
         gt_image = F.interpolate(                 # 将图片特征插值到与图像相同的size
-            gt_image,
+            gt_image.unsqueeze(0),
             size=(fine_resolution[0], fine_resolution[1]),
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
-        
         gt_depth = F.interpolate(                 # 将图片depth插值到与图像相同的size
-            gt_depth,
+            gt_depth.permute(0, 3, 1, 2),  # (1,H,W,C) -> (1,C,H,W)
             size=(fine_resolution[0], fine_resolution[1]),
             mode="bilinear",
             align_corners=False,
-        ).squeeze(0)
+        ).squeeze(0)  # (1,C,H,W) -> (C,H,W)
         
         gt_depth_confidence = F.interpolate(                 # 将图片depth confidence插值到与图像相同的size
-            gt_depth_confidence,
+            gt_depth_confidence.unsqueeze(1),  # (1,H,W) -> (1,1,H,W)
             size=(fine_resolution[0], fine_resolution[1]),
             mode="bilinear",
             align_corners=False,
-        ).squeeze(0)
+        ).squeeze(0)  # (1,1,H,W) -> (1,H,W)
 
 
         # 外参
@@ -447,6 +458,7 @@ def matching_oriented_sample(
             gaussians,
             gt_image,
             gt_depth,
+            gt_depth_confidence,
             viewmat,
             K,
             render_visible_mask=render_visible_masks[viewpoint_cam.image_name],
